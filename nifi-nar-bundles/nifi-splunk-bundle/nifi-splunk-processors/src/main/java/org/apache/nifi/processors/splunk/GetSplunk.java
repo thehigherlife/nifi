@@ -77,7 +77,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 @TriggerSerially
 @InputRequirement(InputRequirement.Requirement.INPUT_FORBIDDEN)
 @Tags({"get", "splunk", "logs"})
-@CapabilityDescription("Retrieves data from Splunk Enterprise.")
+@CapabilityDescription("Retrieves data from Splunk Enterprise. RD Edited")
 @WritesAttributes({
         @WritesAttribute(attribute="splunk.query", description = "The query that performed to produce the FlowFile."),
         @WritesAttribute(attribute="splunk.earliest.time", description = "The value of the earliest time that was used when performing the query."),
@@ -156,6 +156,8 @@ public class GetSplunk extends AbstractProcessor implements ClassloaderIsolation
             "The processor will manage the date ranges of the query starting from the current time.");
     public static final AllowableValue PROVIDED_VALUE = new AllowableValue("Provided", "Provided",
             "The the time range provided through the Earliest Time and Latest Time properties will be used.");
+    public static final AllowableValue MANAGED_ARCHIVED_VALUE = new AllowableValue("Managed Archive", "Managed Archive",
+            "This will use Managed Start Time, Managed Archived Time, and Managed Betweeen Time  This will go back in time and get old data based on the search.");
 
     public static final PropertyDescriptor TIME_RANGE_STRATEGY = new PropertyDescriptor.Builder()
             .name("Time Range Strategy")
@@ -165,7 +167,7 @@ public class GetSplunk extends AbstractProcessor implements ClassloaderIsolation
                     "records searched. When using <Managed from Current> the earliest time of the first execution will be the " +
                     "initial execution time. When using <Provided>, the time range will come from the Earliest Time and Latest Time " +
                     "properties, or no time range will be applied if these properties are left blank.")
-            .allowableValues(MANAGED_BEGINNING_VALUE, MANAGED_CURRENT_VALUE, PROVIDED_VALUE)
+            .allowableValues(MANAGED_BEGINNING_VALUE, MANAGED_CURRENT_VALUE, PROVIDED_VALUE, MANAGED_ARCHIVED_VALUE)
             .defaultValue(PROVIDED_VALUE.getValue())
             .required(true)
             .build();
@@ -181,6 +183,27 @@ public class GetSplunk extends AbstractProcessor implements ClassloaderIsolation
             .name("Latest Time")
             .description("The value to use for the latest time when querying. Only used with a Time Range Strategy of Provided. " +
                     "See Splunk's documentation on Search Time Modifiers for guidance in populating this field.")
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .required(false)
+            .build();
+    public static final PropertyDescriptor MANAGED_START_TIME = new PropertyDescriptor.Builder()
+            .name("Managed Start Time")
+            .description("The value to use for the first time to collect when querying. Only used with a Time Range Strategy of Managed Archive. " +
+                    "Defaults to NOW. 'yyyy-MM-dd'T'HH:mm:ss.SSSZ'")
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .required(false)
+            .build();
+    public static final PropertyDescriptor MANAGED_ARCHIVED_TIME = new PropertyDescriptor.Builder()
+            .name("Managed Archived Time")
+            .description("The value to use for the last time when querying. Only used with a Time Range Strategy of Managed Archive. " +
+                    "This time will be how far back the searches will increment to. IT ALSO ISN'T WORKING YET. 'yyyy-MM-dd'T'HH:mm:ss.SSSZ'")
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .required(false)
+            .build();
+    public static final PropertyDescriptor MANAGED_BETWEEN_TIME = new PropertyDescriptor.Builder()
+            .name("Managed Between Time")
+            .description("The value to use for how long between queries. Only used with a Time Range Strategy of Managed Archive. " +
+                    "This allows you to set the time range that each query uses. This is in seconds")
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .required(false)
             .build();
@@ -294,6 +317,9 @@ public class GetSplunk extends AbstractProcessor implements ClassloaderIsolation
         descriptors.add(EARLIEST_TIME);
         descriptors.add(LATEST_TIME);
         descriptors.add(TIME_ZONE);
+        descriptors.add(MANAGED_START_TIME);
+        descriptors.add(MANAGED_ARCHIVED_TIME);
+        descriptors.add(MANAGED_BETWEEN_TIME);
         descriptors.add(APP);
         descriptors.add(OWNER);
         descriptors.add(TOKEN);
@@ -352,7 +378,9 @@ public class GetSplunk extends AbstractProcessor implements ClassloaderIsolation
                 || descriptor.equals(TIME_RANGE_STRATEGY)
                 || descriptor.equals(EARLIEST_TIME)
                 || descriptor.equals(LATEST_TIME)
-                || descriptor.equals(HOSTNAME))
+                || descriptor.equals(HOSTNAME)
+                || descriptor.equals(MANAGED_ARCHIVED_TIME)
+                || descriptor.equals(MANAGED_START_TIME))
                 ) {
             getLogger().debug("A property that require resetting state was modified - {} oldValue {} newValue {}", descriptor.getDisplayName(), oldValue, newValue);
             resetState = true;
@@ -436,10 +464,28 @@ public class GetSplunk extends AbstractProcessor implements ClassloaderIsolation
                     if (MANAGED_CURRENT_VALUE.getValue().equals(timeRangeStrategy)) {
                         earliestTime = dateFormat.format(new Date(currentTime));
                     }
-
-                    // no previous state so set the latest time to the current time
-                    latestTime = dateFormat.format(new Date(currentTime));
-
+                    if (MANAGED_ARCHIVED_VALUE.getValue().equals(timeRangeStrategy)){
+                        // we are getting archived data.  using the set states on what to get.
+                        final String managedStartTime = context.getProperty(MANAGED_START_TIME).getValue();
+                        final Date managedStartDate = dateFormat.parse(managedStartTime);
+                        //if mananagedStartTime is set use it, otherwise set it to current time
+                        if (managedStartTime != null){
+                            
+                            earliestTime = dateFormat.format(new Date(managedStartDate.getTime()));
+                            latestTime = earliestTime;
+                        }
+                        //set to current time, nothing was specified. 
+                        else {
+                            earliestTime = dateFormat.format(new Date(currentTime));
+                            latestTime = dateFormat.format(new Date(currentTime));
+                        }
+                    }
+                    else
+                    {
+                        // no previous state so set the latest time to the current time
+                        //shouldn't use this for the new managed archive strategy
+                        latestTime = dateFormat.format(new Date(currentTime));
+                    }                    
                     // if its the first time through don't actually run, just save the state to get the
                     // initial time saved and next execution will be the first real execution
                     if (latestTime.equals(earliestTime)) {
@@ -452,15 +498,26 @@ public class GetSplunk extends AbstractProcessor implements ClassloaderIsolation
                     try {
                         final String previousLastTime = previousRange.getLatestTime();
                         final Date previousLastDate = dateFormat.parse(previousLastTime);
-
-                        earliestTime = dateFormat.format(new Date(previousLastDate.getTime() + 1));
-                        latestTime = dateFormat.format(new Date(currentTime));
+                        
+                        if (MANAGED_ARCHIVED_VALUE.getValue().equals(timeRangeStrategy)){
+                            final String previousEarliestTime = previousRange.getEarliestTime();
+                            final Date previousEarliestDate = dateFormat.parse(previousEarliestTime);
+                            final int betweenTime = context.getProperty(MANAGED_BETWEEN_TIME).asInteger() * 1000;
+                            //we are in the new managed archive thing so use the new values to do this all
+                            earliestTime = dateFormat.format(new Date(previousEarliestDate.getTime() - betweenTime));
+                            latestTime = dateFormat.format(new Date(previousEarliestDate.getTime()));
+                        }
+                        else {
+                            // this is the old code that already existed
+                            earliestTime = dateFormat.format(new Date(previousLastDate.getTime() + 1));
+                            latestTime = dateFormat.format(new Date(currentTime));
+                        }
                     } catch (ParseException e) {
                        throw new ProcessException(e);
                     }
                 }
 
-            } catch (IOException e) {
+            } catch (IOException | ParseException e) {
                 getLogger().error("Unable to load data from State Manager due to {}", e.getMessage(), e);
                 context.yield();
                 return;
